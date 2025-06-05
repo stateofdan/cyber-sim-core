@@ -202,12 +202,12 @@ class LLMWrapper(ABC):
         raise NotImplementedError("LLMWrapper->is_connected not implemented")
     
     @abstractmethod
-    def send(self, user_message: str, system_prompt: int = None) -> str:
+    def send(self, user_message: str, system_prompt_idx: int | list[int] = 0) -> str:
         """Send a user message to the LLM and return the response."""
         raise NotImplementedError("LLMWrapper->send not implemented")
     
     @abstractmethod
-    def decide(self, question: str, response_format: dict, system_prompt: int = None, retries: int = 3) -> str:
+    def decide(self, question: str, response_format: dict, system_prompt_idx: int = None, retries: int = 3) -> str:
         """Make a decision based on the provided question and response format."""
         raise NotImplementedError("LLMWrapper->decide not implemented")
     
@@ -303,6 +303,22 @@ class LLMWrapper(ABC):
             self._conversation = summarized
         else:
             self._decisions = summarized
+    
+    def _system_prompt_constructor(self, prompt: str, system_prompt_idx: int | list[int] = 0):
+        self._logger.debug(f"sys prompt constructor system_prompt index: {system_prompt_idx}")
+        
+        prompt_text = ""
+        if system_prompt_idx is not None:
+            if isinstance(system_prompt_idx, int):
+                prompt_text = f'{self.get_system_prompt(system_prompt_idx)}'
+            elif isinstance(system_prompt_idx, list):
+                prompt_text = ("\n".join(self.get_system_prompt(idx) for idx in system_prompt_idx)).strip()
+            if len(prompt_text) == 0:
+                self._logger.warning(f'No core prompt could be constructed from index {system_prompt_idx}')
+        prompt_text = (f'{prompt_text}\n{prompt}').strip()
+        self._logger.info(f'System Prompt constructed, length: {len(prompt_text)}')
+        self._logger.debug(f'\n-------\nConstructed System Prompt:\n {prompt_text}\n-------\n\n')
+        return prompt_text
 
     def save_LLM_state_to_file(self, filename: str) -> None:
         data = {
