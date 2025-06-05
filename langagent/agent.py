@@ -28,6 +28,9 @@ import logging
 import re
 
 import helpers.message_types as mt
+from jinja2 import Template
+
+from .workflow_engine import WorkflowEngine
 
 class LanguageAgent(threading.Thread):
     def __init__(self, pubsub_node:PubSubNode, lm_client: LLMWrapper, config:dict, state_store_on_quit: bool=True):
@@ -35,10 +38,18 @@ class LanguageAgent(threading.Thread):
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self._logger.debug(f"Debugging enabled for {self.__class__.__module__}.{self.__class__.__name__}")
 
-
         self.__agent_id = config.get("agent_id", "default_agent")
         system_prompts = config.get("system_prompts", [])
         self.__state_store_on_quit = state_store_on_quit
+
+        self._workflow_config_str = config.get("workflow", None)
+        if self._workflow_config_str is None:
+            self._logger.critical(f'Workflow not found in LanguageAgent config')
+            raise ValueError(f'Workflow not found in LanguageAgent config')
+        self._workflow_engine = WorkflowEngine.from_json(self._workflow_config_str, 
+                                                         self._workflow_decide, 
+                                                         self._workflow_generate,
+                                                         self._logger)
 
         self.__pubsubnode = pubsub_node
         self.__lm_client = lm_client
@@ -99,6 +110,71 @@ class LanguageAgent(threading.Thread):
     def on_direct_control_callback(self, topic:str, message:str):
         self._handle_ctrl_msg(topic, message)
 
+
+    def _workflow_decide(self, prompt:str, options:List[str], context_stack:List[str]):
+        prompt_template = Template(prompt)
+        substitute_dict = {"sender": context_stack[0],
+                        "message": context_stack[1],
+                        "context": context_stack}
+        prompt_render = prompt_template.render(**substitute_dict)
+
+        self._logger.debug(f"[DECIDE] {prompt_render}\nOptions: {options}")
+        decisions = tuple(set(options))
+        response_format = create_choice_decision_format_class(decisions).create_request_format()
+        reply = self.__lm_client.decide(prompt_render, response_format=response_format)
+        reply_dict = json.loads(reply)
+        choice = reply_dict['decision']
+        confidence = reply_dict['confidence']
+        self._logger.info(f'[DECIDE] success:{choice}, confidence:{confidence}')
+        self._logger.debug(f"\n-----[DECIDE]-----\nDecision response:\n{reply}\n----------\n")
+
+        context_stack.append(reply_dict['explanation'])
+        self._logger.info(f'[DECIDE] Successfully Completed')
+    
+        return choice, confidence
+
+    def _workflow_generate(self, prompt:str, channels: List[str], context_stack: List[str]):
+        prompt_template = Template(prompt)
+        substitute_dict = {"sender": context_stack[0],
+                            "message": context_stack[1],
+                            "context": context_stack}
+        prompt_render = prompt_template.render(**substitute_dict)
+
+        channels_rendered = []
+        for channel in channels:
+            channels_rendered.append(Template(channel).render(sender=context_stack[0]))
+
+        self._logger.debug(f"[GENERATE] {prompt_render}")
+        dm_reply = self.__lm_client.send(prompt_render, 0)
+        self._logger.info(f"[GENERATE] Success reply length {len(dm_reply)}")
+        self._logger.debug(f"\n-----[GENERATE]-----\reply response:\n{dm_reply}\n----------\n")
+        def extract_think_and_reply(text: str) -> dict:
+            match = re.match(r'<think>(.*?)</think>(.*)', text, flags=re.DOTALL)
+            if match:
+                return {
+                    "think": match.group(1).strip(),
+                    "reply": match.group(2).strip()
+                }
+            else:
+                return {
+                    "think": None,
+                    "reply": text.strip()
+                }
+        dict_dm_reply = extract_think_and_reply(dm_reply)
+        
+        self._logger.debug(f'Reasoning:\n{dict_dm_reply['think']}')
+        self._logger.debug(f'Response:\n{dict_dm_reply['reply']}')
+        context_stack.append(dict_dm_reply['think'])
+        context_stack.append(dict_dm_reply['reply'])
+        
+        response_dm = mt.DirectMessage(sender=self.__agent_id, text=dict_dm_reply['reply'])
+        self._logger.debug(f'\n\n----- [GENERATE] Sending -----\nsending message {dict_dm_reply['reply']}\n')
+        for channel in channels_rendered:
+            self._logger.debug(f'To Channel: {channel}\n')
+            self.__pubsubnode.publish(f"direct_msg/{context_stack[0]}", response_dm.to_json())
+        self._logger.info(f'[GENERATE] Successfully Completed')
+        
+
     def on_direct_message(self, topic:str, message:str): 
         dm_msg = None
         try:
@@ -111,41 +187,9 @@ class LanguageAgent(threading.Thread):
             raise # this just raises the exceptione again by default
 
         dm = dm_msg.text
-        decisions = ("yes", "no")
-        response_format = create_choice_decision_format_class(decisions).create_request_format()
-        decision_question = f"You have recieved the following message:\n\n'{dm}'\nyou need to decide whether to respond. \
-                                Explain your reasoning and provide a confidence level in your decision."
-        reply = self.__lm_client.decide(dedent(decision_question), response_format=response_format)
-        reply_dict = json.loads(reply)
-        print (f'Decision:{reply_dict['decision']}, confidence:{reply_dict['confidence']}')
-        print(f"Decision response:{type(reply)}\n{reply}\n")
-        if reply_dict['decision'] == 'yes' and reply_dict['confidence'] > 0.5:
-            self._logger.info(f'Deciding to respond (confidence{reply_dict['confidence']}) to msg:\n{dm[:40]}')
-            chat_prompt = "\n".join((f"You have received the following message:\n\n {dm}\n\n",
-                           f"You have decided to respond as you have reasoned: '{reply_dict['explanation']}'.",
-                           f"Create an appropriate message to send back in response.",
-                           f"only generate the message do not provide any other content.",
-                           f"do not provide any blank or template like fields in this message.",
-                           f"The message should be in the same tone as the orginal."))
-            dm_reply = self.__lm_client.send(chat_prompt, 0)
-            def extract_think_and_reply(text: str) -> dict:
-                match = re.match(r'<think>(.*?)</think>(.*)', text, flags=re.DOTALL)
-                if match:
-                    return {
-                        "think": match.group(1).strip(),
-                        "reply": match.group(2).strip()
-                    }
-                else:
-                    return {
-                        "think": None,
-                        "reply": text.strip()
-                    }
-            dict_dm_reply = extract_think_and_reply(dm_reply)
-            
-            self._logger.debug(f'Reasoning:\n{dict_dm_reply['think']}')
-            self._logger.debug(f'Response:\n{dict_dm_reply['reply']}')
-            response_dm = mt.DirectMessage(sender=self.__agent_id, text=dict_dm_reply['reply'])
-            self.__pubsubnode.publish(f"direct_msg/{dm_msg.sender}", response_dm.to_json())
+        context_stack = [dm_msg.sender,dm]
+        self._workflow_engine.run(context_stack)
+        self._logger.debug(f'Workflow context_stack:\n{json.dumps(context_stack, indent=2)}')
 
     def run(self):
         self._logger.info(f"[{self.__agent_id}] Starting LanguageAgent thread.")

@@ -50,6 +50,58 @@ However, it is also part of a legitimate open-source toolkit used by the develop
 Should I escalate the this for full investigation? 
 '''
 
+json_data = [
+  {
+    "id": 1,
+    "type": "decide",
+    "prompt": ("You have recieved the following message from: {{ sender }} which says:\n"
+                "\n\n{{ message }}\n\n"
+                "You need to decide whether to respond.\n"
+                "Explain your reasoning and provide a confidence level in your decision.").strip(),
+    "options": {
+      "yes": { "target": 2, "threshold": 0.01 },
+      "no": { "target": None, "threshold": 0.01 }
+    }
+  },
+  {
+    "id": 2,
+    "type": "generate",
+    "channels": ["direct_msg/{{ sender }}"],
+    "prompt": ("You have recieved the following message from: {{ sender }} which says:\n"
+                "\n\n{{ message }}\n\n"
+                "You have decided to respond as you have reasoned: {{ context[-1] }}.\n"
+                "Create an appropriate message to send back in response.\n"
+                "only generate the message do not provide any other content.\n"
+                "do not provide any blank or template like fields in this message.\n"
+                "The message should be in the same tone as the orginal.").strip(),
+    "next": None
+  },
+  {
+    "id": 3,
+    "type": "decide",
+    "prompt": ("You have recieved the following message from: {{ sender }} which says:\n"
+                "\n\n{{ message }}\n\n"
+                "You have responded with message:\n\n{{ context[-1] }}\n\n"
+                "and your reasoning for the response is:\n\n{{ context[-3] }}\n\n"
+                "You need to decide whether you are going to create a social media post about it.\n"
+                "Explain your reasoning and provide a confidence level in your decision.").strip(),
+    "options": {
+      "yes": { "target": 4, "threshold": 0.01 },
+      "no": { "target": None, "threshold": 0.3 }
+    }
+  },
+  {
+    "id": 4,
+    "type": "generate",
+    "channels": ["media/social"],
+    "prompt": "Generating a social media post .",
+    "next": None
+  }
+]
+
+json_str = json.dumps(json_data)
+
+
 def test_langague_agent_channels():
     main_logger.info("Starting LanguageAgent channel test...")
     target_agent_id = "target_agent"
@@ -57,13 +109,18 @@ def test_langague_agent_channels():
     target_pubsubnode = MQTTPubSubNode(target_agent_id)
     source_pubsubnode = MQTTPubSubNode(source_agent_id)
     def handler(topic:str, message:str) ->None:
-        print (f'Topic: {topic}\nmessage:\n{json.dumps(json.loads(message), indent=2)}')
+        msg = (f'\n\n------- God is Listening -------\n\n'
+               f'Topic: {topic}\nmessage:\n{json.dumps(json.loads(message), indent=2)}'
+                '--------------------------------\n\n'
+        )
+        print (msg)
 
     source_pubsubnode.register_handler("direct_msg/god", handler)
     lm_client = LMStudioManager(base_url="http://localhost:1234/v1/", model="qwen-7b")
 
     config = {"agent_id": target_agent_id,
-              "system_prompts":[persona_prompt1]
+              "system_prompts":[persona_prompt1],
+              "workflow": json_str,
               }
     
 
@@ -78,6 +135,7 @@ def test_langague_agent_channels():
 
     # Allow agent to start up
     time.sleep(10)
+    print ("\n\n\n\n=====================================================================")
 
     # Send messages to each channel
     ctrl_msg = message_types.ControlMessage(sender="god", command="hello control", args=None)
