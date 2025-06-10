@@ -50,10 +50,13 @@ However, it is also part of a legitimate open-source toolkit used by the develop
 Should I escalate the this for full investigation? 
 '''
 
+social_json_data = []
+
 json_data = [
   {
     "id": 1,
     "type": "decide",
+    "system_prompts": [0],
     "prompt": ("You have recieved the following message from: {{ sender }} which says:\n"
                 "\n\n{{ message }}\n\n"
                 "You need to decide whether to respond.\n"
@@ -66,6 +69,7 @@ json_data = [
   {
     "id": 2,
     "type": "generate",
+    "system_prompts": [0],
     "channels": ["direct_msg/{{ sender }}"],
     "prompt": ("You have recieved the following message from: {{ sender }} which says:\n"
                 "\n\n{{ message }}\n\n"
@@ -79,6 +83,7 @@ json_data = [
   {
     "id": 3,
     "type": "decide",
+    "system_prompts": [0],
     "prompt": ("You have recieved the following message from: {{ sender }} which says:\n"
                 "\n\n{{ message }}\n\n"
                 "You have responded with message:\n\n{{ context[-1] }}\n\n"
@@ -93,6 +98,7 @@ json_data = [
   {
     "id": 4,
     "type": "generate",
+    "system_prompts": [0],
     "channels": ["media/social"],
     "prompt": "Generating a social media post .",
     "next": None
@@ -106,6 +112,7 @@ def test_langague_agent_channels():
     main_logger.info("Starting LanguageAgent channel test...")
     target_agent_id = "target_agent"
     source_agent_id = "source_agent"
+
     target_pubsubnode = MQTTPubSubNode(target_agent_id)
     source_pubsubnode = MQTTPubSubNode(source_agent_id)
     def handler(topic:str, message:str) ->None:
@@ -116,16 +123,26 @@ def test_langague_agent_channels():
         print (msg)
 
     source_pubsubnode.register_handler("direct_msg/god", handler)
-    lm_client = LMStudioManager(base_url="http://localhost:1234/v1/", model="qwen-7b")
+ 
+    channels = ['direct_msg/{{ agent_id }}',
+                'social_media/#',       # You dont need to subscribe to your own Social media as you publish to it. '# will subscibe to eveyones.
+                ]
+
+    workflows = {'direct_msg/{{ agent_id }}': json_str,
+                'social_media/#': json_str,}
+
 
     config = {"agent_id": target_agent_id,
               "system_prompts":[persona_prompt1],
-              "workflow": json_str,
+              "channels": channels,
+              "workflows": workflows,
               }
     
 
     main_logger.debug(json.dumps(config, indent=2))
 
+
+    lm_client = LMStudioManager(base_url="http://localhost:1234/v1/", model="qwen-7b")
     agent = LanguageAgent(target_pubsubnode, lm_client, config)
     agent_thread = threading.Thread(target=agent.run)
     agent_thread.start()
@@ -152,7 +169,6 @@ def test_langague_agent_channels():
     ctrl_msg.command = "quit"
     source_pubsubnode.publish("control", ctrl_msg.to_json())
     time.sleep(0.2)
-    source_pubsubnode.stop()
 
     # Wait for agent to stop
     agent_thread.join(timeout=120)
@@ -166,6 +182,8 @@ def test_langague_agent_channels():
             main_logger.info("Agent thread stopped successfully.")
     else:
         main_logger.info("Agent thread stopped successfully first time.")
+    
+    source_pubsubnode.stop()
 
 
 if __name__ == "__main__":

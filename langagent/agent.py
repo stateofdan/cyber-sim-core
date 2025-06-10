@@ -17,7 +17,7 @@ import threading
 from pubsubnode.pubsubnode import PubSubNode
 import queue
 
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Tuple
 from textwrap import dedent
 import json
 
@@ -36,46 +36,76 @@ class LanguageAgent(threading.Thread):
     def __init__(self, pubsub_node:PubSubNode, lm_client: LLMWrapper, config:dict, state_store_on_quit: bool=True):
         super().__init__()
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
-        self._logger.debug(f"[__INIT__]Debugging enabled for {self.__class__.__module__}.{self.__class__.__name__}")
-
-        self.__agent_id = config.get("agent_id", "default_agent")
-        system_prompts = config.get("system_prompts", [])
-        self.__state_store_on_quit = state_store_on_quit
-
-        self._workflow_config_str = config.get("workflow", None)
-        if self._workflow_config_str is None:
-            self._logger.critical(f'[__INIT__] Workflow not found in LanguageAgent config')
-            raise ValueError(f'Workflow not found in LanguageAgent config')
-        self._workflow_engine = WorkflowEngine.from_json(self._workflow_config_str, 
-                                                         self._workflow_decide, 
-                                                         self._workflow_generate,
-                                                         self._logger)
+        self._logger.debug(f"[__INIT__] Debugging enabled for {self.__class__.__module__}.{self.__class__.__name__}")
 
         self.__pubsubnode = pubsub_node
         self.__lm_client = lm_client
+        self.__state_store_on_quit = state_store_on_quit
 
+        if pubsub_node is None:
+            self._logger.critical(f'[__INIT__] pubsub_node object is None')
+            raise ValueError(f'[__INIT__] pubsub_node object is None')
+        if not isinstance(pubsub_node, PubSubNode):
+            self._logger.critical(f'[__INIT__] pubsub_node is not a PubSubNode. Got {type(pubsub_node)}')
+            raise ValueError(f'[__INIT__] pubsub_node is not a PubSubNode. Got {type(pubsub_node)}')
+        
+        if lm_client is None:
+            self._logger.critical(f'[__INIT__] lm_client object is None')
+            raise ValueError(f'[__INIT__] lm_client object is None')
+        if not isinstance(lm_client, LLMWrapper):
+            self._logger.critical(f'[__INIT__] lm_client is not an LLMWrapper. Got {type(lm_client)}')
+            raise ValueError(f'[__INIT__] lm_client is not a PubSubNode. Got {type(lm_client)}')  
+        # End of storing passed in Variables
+
+        self.__agent_id = config.get("agent_id", "default_agent")
+        if self.__agent_id == "default_agent":
+            self._logger.warning("[__INIT__] No agent_id in config using 'default_agent.")
+        self._logger.debug(f'[__INIT__] Agent id set to {self.__agent_id}')
+
+        system_prompts = config.get("system_prompts", [])
+        if len(system_prompts) == 0:
+            self._logger.warning("[__INIT__] No System Prompts specified for the agent.")
         for prompt in system_prompts:
-            self.__lm_client.add_system_prompt(prompt)      
+            self.__lm_client.add_system_prompt(prompt) 
+        self._logger.debug(f'[__INIT__] loaded prompt: {"\n".join(self.__lm_client.iter_system_prompts())}')
+    
+        workflows = config.get('workflows', None)
 
+        self._workflows = {}
 
-        self.__handlers: Dict[str, List[Callable[[str], None]]] = {}
+        if workflows is None:
+            self._logger.critical(f'[__INIT__] No workflows specified in config')
+            raise ValueError(f'[__INIT__] No workflows specified in config')
+        
+        for topic, workflow_cfg_str in workflows.items():
+            channel = Template(topic).render(agent_id=self.__agent_id)
+            self._workflows[channel] = WorkflowEngine.from_json(workflow_cfg_str, 
+                                                                self._workflow_decide, 
+                                                                self._workflow_generate,
+                                                                self._logger)
+        self._logger.info(f'[__INIT__] Loaded {len(self._workflows)} workflows out of {len(workflows)}')
+
+        # End of config loading and checking.
+
         self.__msg_queue = queue.Queue()
-        self.__running = True
+        self.__handlers: Dict[str, List[Callable[[str], None]]] = {}
 
         # Connect to the main control topic channel
-        #self.__pubsubnode.register_handler("control", self.handle_message)
         self.register_handler("control", self.on_all_control_callback)
 
         # connect to the agent-specific control topic channel
-        #self.__pubsubnode.register_handler(f"control/{self.__agent_id}", self.handle_message)
         self.register_handler(f"control/{self.__agent_id}", self.on_direct_control_callback)
 
-        # Connect to the agent-specific input topic channel - used to send direct messages between agents for example alerting
-        #self.__pubsubnode.register_handler(f"agents/{self.__agent_id}/in_dm", self.handle_message)
-        self.register_handler(f"direct_msg/{self.__agent_id}", self.on_direct_message)
-        self._logger.info(f"[__INIT__] LanguageAgent initialized with ID: {self.__agent_id}")
-
-    
+        for topic in self._workflows.keys():
+            #handler = self.on_message_do_workflow
+            #if topic == f"direct_msg/{self.__agent_id}":
+            #    handler = self.on_direct_message
+            self.register_handler(topic, self.on_message_do_workflow)
+            self._logger.debug(f'[__INIT__] Registered handler for topic {topic}: {self.on_message_do_workflow.__name__}')
+        self._logger.info(f'[__INIT__] Registered {len(self._workflows)} topics')
+ 
+        self._logger.info(f"[__INIT__] LanguageAgent initialized with ID: {self.__agent_id}\n{'+'*30}\n")
+           
     def register_handler(self, topic: str, handler: Callable[[str], None]):
         self.__handlers.setdefault(topic, []).append(handler)
         self.__pubsubnode.register_handler(topic, self.handle_message)
@@ -86,7 +116,7 @@ class LanguageAgent(threading.Thread):
     def handle_message(self, topic: str, message: str):
         self.__msg_queue.put((topic, message))
         self._logger.info(f"[HANDLE] Queued message for {self.__agent_id}")
-        self._logger.debug(f'[HANDLE] Received message from {topic}:'
+        self._logger.debug(f'[HANDLE] Received message from {topic}:\n'
                             f'{'-'*20}\n'
                             f'{message if len(message) <=60 else f'{message[:25]}\n...\n{message[-25:]}\n'}'
                             f'{'-'*20}\n')
@@ -129,7 +159,7 @@ class LanguageAgent(threading.Thread):
         self._logger.info(f'[DIRECT_CTRL] Finished Message Processing\n{'='*20}\n')
 
 
-    def _workflow_decide(self, prompt:str, options:List[str], context_stack:List[str]):
+    def _workflow_decide(self, prompt:str, sys_prompts:List[int], options:List[str], context_stack:List[str]):
         self._logger.info(f'[DECIDE] workflow decision started')
         prompt_template = Template(prompt)
         substitute_dict = {"sender": context_stack[0],
@@ -144,7 +174,7 @@ class LanguageAgent(threading.Thread):
         response_format = create_choice_decision_format_class(decisions).create_request_format()
         self._logger.info(f'[DECIDE] Response Format scehema created for {len(decisions)} created.')
         self._logger.debug(f'[DECIDE] Response Format Schema:\n{'-'*20}\n{json.dumps(response_format, indent=2)}\n{'-'*20}')
-        reply = self.__lm_client.decide(prompt_render, response_format=response_format)
+        reply = self.__lm_client.decide(prompt_render, response_format=response_format, system_prompt_idx=sys_prompts)
         self._logger.info(f'[DECIDE] Success reply length: {len(reply)}')
         self._logger.debug(f'[DECIDE] Reply response:\n{'-'*20}\n{reply}\n{'-'*20}')
         reply_dict = json.loads(reply)
@@ -159,7 +189,7 @@ class LanguageAgent(threading.Thread):
     
         return choice, confidence
 
-    def _workflow_generate(self, prompt:str, channels: List[str], context_stack: List[str]):
+    def _workflow_generate(self, prompt:str, sys_prompts:List[int], channels: List[str], context_stack: List[str]):
         self._logger.info(f"[GENERATE] Workflow generations started")
         prompt_template = Template(prompt)
         substitute_dict = {"sender": context_stack[0],
@@ -172,7 +202,7 @@ class LanguageAgent(threading.Thread):
             channels_rendered.append(Template(channel).render(sender=context_stack[0]))
 
         self._logger.debug(f"[GENERATE] Prompt Render\n{'-'*20}\n{prompt_render}\n{'-'*20}")
-        dm_reply = self.__lm_client.send(prompt_render, 0)
+        dm_reply = self.__lm_client.send(prompt_render, sys_prompts)
         self._logger.info(f"[GENERATE] Success reply length: {len(dm_reply)}")
         self._logger.debug(f"[GENERATE] Reply response:\n{'-'*20}\n{dm_reply}\n{'-'*20}")
         def extract_think_and_reply(text: str) -> dict:
@@ -203,15 +233,63 @@ class LanguageAgent(threading.Thread):
         self._logger.info(f'[GENERATE] Successfully Completed\n{'='*20}\n')
         
 
-    def on_direct_message(self, topic:str, message:str):
-        self._logger.info(f'[DIRECT] Begin Processing') 
+    def _mqtt_topic_match(self, sub_topic: str, tgt_topic: str) -> bool:
+        sub_tokens = sub_topic.split('/')
+        tgt_tokens = tgt_topic.split('/')
+
+        i = 0
+        while i < len(sub_tokens):
+            if i >= len(tgt_tokens):
+                # if the sub_tpic has more tockns but target topic has ended,
+                # only match if the last token is '#' (matches zero or more levels)
+                return sub_tokens[i] == '#' and i == len(sub_tokens) - 1
+            
+            if sub_tokens[i] == '#':
+                # '#' must be last token and matches all remaining topic tokens
+                return i == len(sub_tokens) - 1
+            
+            if sub_tokens[i] == '+':
+                # '+' matches exactly one topic level
+                i+= 1
+                continue
+            
+            if sub_tokens[i] != tgt_tokens[i]:
+                return False
+                
+            i += 1
+        return i == len(tgt_tokens)
+    
+
+    def _get_best_workflow(self, topic: str)-> Tuple[str, WorkflowEngine]:
+        matched = []
+        for sub_topic, workflow in self._workflows.items():
+            if self._mqtt_topic_match(sub_topic, topic):
+                matched.append((sub_topic, workflow))
+        if not matched:
+            return None, None
+        
+        best_sub_topic, best_workflow = max(matched, key=lambda x: len(x[0]))
+        return best_sub_topic, best_workflow
+
+
+    def on_message_do_workflow(self, topic:str, message:str):
+        self._logger.info(f'[DIRECT] Begin Processing')
+
+        sub_topic, workflow = self._get_best_workflow(topic) # not sure this would match topic/# type entries.
+        if workflow is None:
+            self._logger.warning(f'[DIRECT] No workflow for topic: {topic}\n\n{'+'*20}\nFAILED PROCESSING\n{'+'*20}\n')
+            return
+        self._logger.info(f'[DIRECT] Found workflow for {topic}')
+        self._logger.debug(f'[DIRECT] Topic {topic} matched with {sub_topic}')
+    
+
         dm_msg = None
         try:
             dm_msg = mt.BaseMessage.from_json(message)
             if not isinstance(dm_msg, mt.DirectMessage):
                 raise TypeError("Expected DirectMessage, got " + type(dm_msg).__name__)
             self._logger.info(f'[DIRECT] message decoded correctly')
-            self._logger.debug(f'[DIRECT] Received message on {topic}:'
+            self._logger.debug(f'[DIRECT] Received message on {topic}:\n'
                                f'{'-'*20}\n'
                                f'{message if len(message) <=60 else f'{message[:25]}\n...\n{message[-25:]}\n'}'
                                f'{'-'*20}\n')
@@ -223,7 +301,8 @@ class LanguageAgent(threading.Thread):
 
         dm = dm_msg.text
         context_stack = [dm_msg.sender,dm]
-        self._workflow_engine.run(context_stack)
+        #self._workflow_engine.run(context_stack)
+        workflow.run(context_stack)
         self._logger.info(f'[DIRECT] Workflow completed successfully')
         self._logger.debug(f'[DIRECT] Workflow completed context_stack:\n'
                            f'{'-'*20}\n{json.dumps(context_stack, indent=2)}\n{'-'*20}')
@@ -232,6 +311,7 @@ class LanguageAgent(threading.Thread):
     def run(self):
         self._logger.info(f"[RUN] Starting LanguageAgent thread for {self.__agent_id}")
         self.__pubsubnode.start()
+        self.__running = True
 
         while self.__running:
             self._logger.debug(f"[RUN] {self.__agent_id}] checking message queue")
@@ -245,15 +325,16 @@ class LanguageAgent(threading.Thread):
                     self.on_all_control_callback(topic, message)
                 elif topic.startswith("control/"):
                     self.on_direct_control_callback(topic, message)
-                elif topic.startswith("direct_msg/"):
-                    self.on_direct_message(topic, message)
+                #elif topic.startswith("direct_msg/"):
+                else:
+                    self.on_message_do_workflow(topic, message)
                 self._logger.info(f'[RUN] Agent {self.__agent_id} Message processed correctly')
             except queue.Empty:
                 self._logger.debug(f"[RUN] Agent {self.__agent_id} No messages in queue, continuing...")
                 continue
             except Exception as e:
-                self._logger.critical(f'[RUN] Agent {self.__agent_id} Exception in agent thread:'
-                                      f'{'-'*20}\n{e}\n{'-'*20}'
+                self._logger.critical(f'[RUN] Agent {self.__agent_id} Exception in agent thread:\n'
+                                      f'{'-'*20}\n{e}\n{'-'*20}\n'
                                       f'{'x'*10} STOPPING {'x'*10}\n')
                 self.__running = False
         
